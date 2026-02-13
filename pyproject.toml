@@ -11,5 +11,6 @@ dependencies = [
     "pandas>=3.0.0",
     "pinecone>=8.0.0",
     "pypdf>=6.6.2",
+    "pypdf2>=3.0.1",
     "supabase>=2.27.2",
 ]
