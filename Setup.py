@@ -18,8 +18,6 @@ print('OpenAI API works')
 
 url = os.getenv("SUPABASE_URL")
 key = os.getenv("SUPABASE_KEY")
-
-
 supabase = create_client(str(url),str(key))
 
 print('Supabase works')
