@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 import PyPDF2
 import io
 import os
@@ -13,6 +13,45 @@ app = FastAPI()
 url = os.getenv("SUPABASE_URL")
 key = os.getenv("SUPABASE_KEY")
 supabase = create_client(str(url),str(key))
+
+
+@app.get("/api/candidates/{id}")
+async def get_candidate_by_id(id: str):
+    """Get single candidate by ID"""
+    result = supabase.table("candidates").select("*").eq("id", id).execute()
+
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+
+    return result.data[0]
+
+
+@app.get("/api/candidates")
+async def list_candidates(
+    page: int = Query(1, ge=1),
+    limit: int = Query(10, ge=1, le=100)
+):
+    """List all candidates with pagination"""
+    start = (page - 1) * limit
+    end = start + limit - 1
+
+    result = (
+        supabase
+        .table("candidates")
+        .select("*", count="exact")
+        .order("id", desc=True)
+        .range(start, end)
+        .execute()
+    )
+
+    total = result.count if result.count is not None else len(result.data)
+
+    return {
+        "page": page,
+        "limit": limit,
+        "total": total,
+        "data": result.data
+    }
 
 def extract_text_from_pdf(file_content: bytes) -> str:
     """Extract text from PDF"""
