@@ -2,10 +2,13 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 import PyPDF2
 import io
 import os
+import uuid
 from supabase import create_client, Client
 from dotenv import load_dotenv
 from openai import OpenAI
 from datetime import datetime
+from pinecone import Pinecone
+from embeddings import generate_embedding
 
 load_dotenv()
 
@@ -13,6 +16,8 @@ app = FastAPI()
 url = os.getenv("SUPABASE_URL")
 key = os.getenv("SUPABASE_KEY")
 supabase = create_client(str(url),str(key))
+pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+pinecone_index = pc.Index("text022026")
 
 
 @app.get("/api/candidates/{id}")
@@ -93,6 +98,15 @@ async def upload_resume(
 )
     summary = response.choices[0].message.content
 
+    # Generate embedding and upsert to Pinecone
+    vector = generate_embedding(raw_text)
+    vector_id = str(uuid.uuid4())
+    pinecone_index.upsert(vectors=[{
+        "id": vector_id,
+        "values": vector,
+        "metadata": {"filename": file.filename, "name": name or "", "email": email or ""}
+    }]) 
+
     # Upload resume to Supabase storage bucket
     storage_path = f"resumes/{datetime.now().timestamp()}_{file.filename}"
     supabase.storage.from_("resumes").upload(
@@ -108,7 +122,8 @@ async def upload_resume(
     "email": email,
     "resume_file_url": resume_url,
     "raw_text": raw_text,
-    "summary": summary}).execute()
+    "summary": summary,
+    "vector_id": vector_id}).execute()
 
     candidate_id = result.data[0]["id"]
 
@@ -116,5 +131,6 @@ async def upload_resume(
         "message": "Resume uploaded successfully",
         "candidate_id": candidate_id,
         "filename": file.filename,
-        "resume_url": resume_url
+        "resume_url": resume_url,
+        "vector_id": vector_id
     }
