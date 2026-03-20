@@ -11,6 +11,7 @@ from openai import OpenAI
 from datetime import datetime
 from pinecone import Pinecone
 from embeddings import generate_embedding
+import json
 
 class SearchRequest(BaseModel):
     query: str
@@ -182,7 +183,19 @@ async def search_candidates(request: SearchRequest) -> list[SearchResult]:
         HTTPException 400: If query is empty
         HTTPException 500: If embedding generation or search fails
     """
-    raise NotImplementedError
+    query_text = request.query.strip()
+    if not query_text:
+        raise HTTPException(status_code=400, detail="Search query cannot be empty")
+    
+    vector = generate_embedding(query_text)
+
+    results = query_pinecone(vector, request.top_k)
+    candidates = fetch_candidates_by_vector_ids([result["id"] for result in results])
+
+    if request.rerank:
+        candidates = rerank_with_llm(query_text, candidates)
+
+    return candidates
 
 
 def query_pinecone(query_vector: list[float], top_k: int) -> list[dict]:
@@ -202,7 +215,22 @@ def query_pinecone(query_vector: list[float], top_k: int) -> list[dict]:
             - score: Cosine similarity score (0.0 to 1.0)
             - metadata: Dict with filename, name, email
     """
-    raise NotImplementedError
+    response = pinecone_index.query(
+        vector=query_vector,
+        top_k=top_k,
+        include_metadata=True
+    )
+
+    matches = response["matches"] if isinstance(response, dict) else response.matches
+
+    return [
+        {
+            "id": match["id"] if isinstance(match, dict) else match.id,
+            "score": float(match["score"] if isinstance(match, dict) else match.score),
+            "metadata": match.get("metadata", {}) if isinstance(match, dict) else (match.metadata or {})
+        }
+        for match in matches
+    ]
 
 
 def fetch_candidates_by_vector_ids(vector_ids: list[str]) -> list[dict]:
@@ -219,7 +247,8 @@ def fetch_candidates_by_vector_ids(vector_ids: list[str]) -> list[dict]:
         List of candidate dicts from Supabase, each containing:
             - id, name, email, resume_file_url, raw_text, summary, vector_id
     """
-    raise NotImplementedError
+    result = supabase.table("candidates").select("*").in_("vector_id", vector_ids).execute()
+    return result.data if result.data else []
 
 
 def rerank_with_llm(query: str, candidates: list[dict]) -> list[dict]:
@@ -239,7 +268,41 @@ def rerank_with_llm(query: str, candidates: list[dict]) -> list[dict]:
         Same list of candidates re-ordered by LLM-determined relevance,
         with an added 'relevance_score' field (0.0 to 1.0)
     """
-    raise NotImplementedError
+
+    if not candidates:
+        return []
+
+    ranking_payload = [
+        {
+            "id": candidate.get("id"),
+            "summary": candidate.get("summary", "")
+        }
+        for candidate in candidates
+    ]
+
+    candidates_json = json.dumps(ranking_payload, ensure_ascii=False)
+
+    client = OpenAI(api_key = os.getenv('OPENAI_API_KEY'))
+    response = client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[
+        {
+            "role": "system",
+            "content": "You are a recruiting relevance ranker. Rank candidates only by how well their summary matches the search query. Do not invent data. Use only provided fields."
+        },
+        {
+            "role": "user",
+            "content": f"Search query: {query}\n\nCandidates:\n{candidates_json}\n\nTask:\n1) Score each candidate on relevance from 0.0 to 1.0.\n2) Return all candidates sorted by relevance_score descending.\n3) Do not omit any candidate IDs.\n4) Add one short field: rationale (max 20 words).\n5) Output strict JSON only in this shape:\n{{\"ranked_candidates\":[{{\"id\":\"...\",\"relevance_score\":0.0,\"rationale\":\"...\"}}]}}"
+        }
+    ]
+    )
+
+    ranked_candidates = response.choices[0].message.content
+
+    if ranked_candidates:
+        return json.loads(ranked_candidates).get("ranked_candidates", [])
+    else:
+        return candidates
 
 
 @app.put("/api/candidates/{id}")
@@ -262,7 +325,21 @@ async def update_candidate(id: str, request: UpdateCandidateRequest) -> dict:
         HTTPException 400: If no fields provided to update
         HTTPException 404: If candidate not found
     """
-    raise NotImplementedError
+
+    if request.name is not None or request.email is not None:
+        update_data = {}
+        if request.name is not None:
+            update_data["name"] = request.name
+        if request.email is not None:
+            update_data["email"] = request.email
+        supabase.table("candidates").update(update_data).eq("id", id).execute()
+    else:
+        raise HTTPException(status_code=400, detail="No fields provided to update")
+    
+    updated_candidate = supabase.table("candidates").select("*").eq("id", id).single().execute()
+    if not updated_candidate.data:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+    return updated_candidate.data
 
 
 @app.delete("/api/candidates/{id}")
@@ -288,7 +365,25 @@ async def delete_candidate(id: str) -> dict:
         HTTPException 404: If candidate not found
         HTTPException 500: If deletion from any service fails
     """
-    raise NotImplementedError
+    result = supabase.table("candidates").select("id").eq("id", id).limit(1).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+    
+    vector_id = result.data[0].get("vector_id")
+    if vector_id:
+        pinecone_index.delete(ids=[vector_id])
+    
+    pdf_url = result.data[0].get("pdf_url")
+    if pdf_url:
+        supabase.storage.from_("resumes").remove([pdf_url])
+    
+    supabase.table("candidates").delete().eq("id", id).execute()
+    
+    if not supabase.table("candidates").select("id").eq("id", id).limit(1).execute().data:
+        return {"message": f"Candidate {id} deleted successfully"}
+    else:
+        raise HTTPException(status_code=500, detail="Failed to delete candidate from database")
+
 
 def find_duplicate_resume(embedding: list[float], threshold: float = 0.95) -> Optional[str]:
     """
@@ -308,4 +403,11 @@ def find_duplicate_resume(embedding: list[float], threshold: float = 0.95) -> Op
     Returns:
         candidate_id of existing resume if duplicate found, None otherwise
     """
-    raise NotImplementedError
+
+    resumes = query_pinecone(embedding, top_k=5)
+
+    for resume in resumes:
+        if resume["score"] >= threshold:
+            return resume["id"]
+        
+    return None
