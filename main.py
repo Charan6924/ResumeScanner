@@ -1,4 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from pydantic import BaseModel
+from typing import Optional
 import PyPDF2
 import io
 import os
@@ -9,6 +11,23 @@ from openai import OpenAI
 from datetime import datetime
 from pinecone import Pinecone
 from embeddings import generate_embedding
+
+class SearchRequest(BaseModel):
+    query: str
+    top_k: int = 10
+    rerank: bool = True
+
+class SearchResult(BaseModel):
+    candidate_id: str
+    name: Optional[str]
+    email: Optional[str]
+    summary: str
+    score: float
+    resume_file_url: str
+
+class UpdateCandidateRequest(BaseModel):
+    name: Optional[str] = None
+    email: Optional[str] = None
 
 load_dotenv()
 
@@ -81,7 +100,6 @@ async def upload_resume(
     # Read file
     file_content = await file.read()
     
-    # TODO: Process resume (parse, store in DB, create embeddings)
     raw_text = extract_text_from_pdf(file_content)
     if not raw_text.strip():
         raise HTTPException(status_code=400, detail="Failed to extract text from PDF")
@@ -134,3 +152,160 @@ async def upload_resume(
         "resume_url": resume_url,
         "vector_id": vector_id
     }
+
+@app.post("/api/search", response_model=list[SearchResult])
+async def search_candidates(request: SearchRequest) -> list[SearchResult]:
+    """
+    Semantic search for candidates using natural language queries.
+
+    This endpoint enables recruiters to find candidates using queries like
+    "Python developers with 5 years experience in machine learning" instead
+    of rigid keyword filters.
+
+    Flow:
+    1. Convert the query text into a vector embedding using OpenAI
+    2. Query Pinecone for the top_k most similar resume vectors
+    3. Fetch full candidate data from Supabase for matched vector IDs
+    4. If rerank=True, use LLM to re-rank results for better relevance
+    5. Return sorted list of candidates with similarity scores
+
+    Args:
+        request: SearchRequest containing:
+            - query: Natural language search query
+            - top_k: Number of results to return (default 10)
+            - rerank: Whether to use LLM re-ranking (default True)
+
+    Returns:
+        List of SearchResult objects sorted by relevance score (highest first)
+
+    Raises:
+        HTTPException 400: If query is empty
+        HTTPException 500: If embedding generation or search fails
+    """
+    raise NotImplementedError
+
+
+def query_pinecone(query_vector: list[float], top_k: int) -> list[dict]:
+    """
+    Query Pinecone index for similar vectors.
+
+    Takes a query vector and returns the top_k most similar vectors
+    from the Pinecone index along with their metadata and scores.
+
+    Args:
+        query_vector: 3072-dimension embedding vector from OpenAI
+        top_k: Maximum number of results to return
+
+    Returns:
+        List of dicts containing:
+            - id: The vector_id (matches candidate's vector_id in Supabase)
+            - score: Cosine similarity score (0.0 to 1.0)
+            - metadata: Dict with filename, name, email
+    """
+    raise NotImplementedError
+
+
+def fetch_candidates_by_vector_ids(vector_ids: list[str]) -> list[dict]:
+    """
+    Fetch full candidate records from Supabase by their vector IDs.
+
+    Takes a list of vector_ids returned from Pinecone and retrieves
+    the complete candidate records from the Supabase database.
+
+    Args:
+        vector_ids: List of vector_id strings to look up
+
+    Returns:
+        List of candidate dicts from Supabase, each containing:
+            - id, name, email, resume_file_url, raw_text, summary, vector_id
+    """
+    raise NotImplementedError
+
+
+def rerank_with_llm(query: str, candidates: list[dict]) -> list[dict]:
+    """
+    Re-rank search results using LLM for improved relevance.
+
+    Vector similarity finds semantically related resumes, but may not
+    perfectly match the recruiter's intent. This function uses GPT to
+    analyze each candidate's summary against the original query and
+    re-order results by true relevance.
+
+    Args:
+        query: The original natural language search query
+        candidates: List of candidate dicts with at least 'summary' field
+
+    Returns:
+        Same list of candidates re-ordered by LLM-determined relevance,
+        with an added 'relevance_score' field (0.0 to 1.0)
+    """
+    raise NotImplementedError
+
+
+@app.put("/api/candidates/{id}")
+async def update_candidate(id: str, request: UpdateCandidateRequest) -> dict:
+    """
+    Update a candidate's metadata (name and/or email).
+
+    Only updates the fields provided in the request. Does not allow
+    updating the resume itself - for that, delete and re-upload.
+    Also updates the metadata in Pinecone to keep it in sync.
+
+    Args:
+        id: The candidate's Supabase ID
+        request: UpdateCandidateRequest with optional name and email fields
+
+    Returns:
+        Updated candidate record from Supabase
+
+    Raises:
+        HTTPException 400: If no fields provided to update
+        HTTPException 404: If candidate not found
+    """
+    raise NotImplementedError
+
+
+@app.delete("/api/candidates/{id}")
+async def delete_candidate(id: str) -> dict:
+    """
+    Delete a candidate and all associated data.
+
+    Removes the candidate from all storage locations:
+    1. Delete vector from Pinecone index
+    2. Delete PDF file from Supabase storage bucket
+    3. Delete candidate record from Supabase database
+
+    Operations should be performed in this order so that if any step
+    fails, the data can still be cleaned up manually.
+
+    Args:
+        id: The candidate's Supabase ID
+
+    Returns:
+        Confirmation message with deleted candidate ID
+
+    Raises:
+        HTTPException 404: If candidate not found
+        HTTPException 500: If deletion from any service fails
+    """
+    raise NotImplementedError
+
+def find_duplicate_resume(embedding: list[float], threshold: float = 0.95) -> Optional[str]:
+    """
+    Check if a similar resume already exists using vector similarity.
+
+    Queries Pinecone with the new resume's embedding to find if there's
+    an existing resume with similarity above the threshold. This catches
+    both exact duplicates and near-duplicates (e.g., slightly reformatted
+    versions of the same resume).
+
+    Should be called during upload flow before upserting to Pinecone.
+
+    Args:
+        embedding: 3072-dimension vector of the new resume
+        threshold: Minimum similarity score to consider a duplicate (default 0.95)
+
+    Returns:
+        candidate_id of existing resume if duplicate found, None otherwise
+    """
+    raise NotImplementedError
