@@ -247,8 +247,12 @@ def fetch_candidates_by_vector_ids(vector_ids: list[str]) -> list[dict]:
         List of candidate dicts from Supabase, each containing:
             - id, name, email, resume_file_url, raw_text, summary, vector_id
     """
-    result = supabase.table("candidates").select("*").in_("vector_id", vector_ids).execute()
-    return result.data if result.data else []
+    if not vector_ids:
+        return []
+
+    result = supabase.table("candidates").select("id, name, email, resume_file_url, raw_text, summary, vector_id").in_("vector_id", vector_ids).execute()
+
+    return result.data
 
 
 def rerank_with_llm(query: str, candidates: list[dict]) -> list[dict]:
@@ -268,41 +272,70 @@ def rerank_with_llm(query: str, candidates: list[dict]) -> list[dict]:
         Same list of candidates re-ordered by LLM-determined relevance,
         with an added 'relevance_score' field (0.0 to 1.0)
     """
-
     if not candidates:
         return []
 
-    ranking_payload = [
-        {
-            "id": candidate.get("id"),
-            "summary": candidate.get("summary", "")
-        }
-        for candidate in candidates
-    ]
+    client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 
-    candidates_json = json.dumps(ranking_payload, ensure_ascii=False)
+    # Build a prompt to score all candidates at once
+    candidate_summaries = "\n\n".join([
+        f"Candidate {i}:\n{c.get('summary', 'No summary available')}"
+        for i, c in enumerate(candidates)
+    ])
 
-    client = OpenAI(api_key = os.getenv('OPENAI_API_KEY'))
     response = client.chat.completions.create(
-    model="gpt-4o-mini",
-    messages=[
-        {
-            "role": "system",
-            "content": "You are a recruiting relevance ranker. Rank candidates only by how well their summary matches the search query. Do not invent data. Use only provided fields."
-        },
-        {
-            "role": "user",
-            "content": f"Search query: {query}\n\nCandidates:\n{candidates_json}\n\nTask:\n1) Score each candidate on relevance from 0.0 to 1.0.\n2) Return all candidates sorted by relevance_score descending.\n3) Do not omit any candidate IDs.\n4) Add one short field: rationale (max 20 words).\n5) Output strict JSON only in this shape:\n{{\"ranked_candidates\":[{{\"id\":\"...\",\"relevance_score\":0.0,\"rationale\":\"...\"}}]}}"
-        }
-    ]
+        model="gpt-4o-mini",
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a recruiter assistant. Score each candidate's relevance to the search query. Return ONLY a JSON array of objects with 'index' (integer) and 'score' (float 0.0-1.0) fields, sorted by score descending."
+            },
+            {
+                "role": "user",
+                "content": f"Query: {query}\n\nCandidates:\n{candidate_summaries}\n\nReturn JSON array with index and score for each candidate, sorted by relevance."
+            }
+        ],
+        response_format={"type": "json_object"},
+        max_tokens=500
     )
 
-    ranked_candidates = response.choices[0].message.content
+    # Parse the LLM response
+    import json
+    scores_raw = json.loads(response.choices[0].message.content)
 
-    if ranked_candidates:
-        return json.loads(ranked_candidates).get("ranked_candidates", [])
+    # Handle both {"results": [...]} and direct [...] formats
+    if isinstance(scores_raw, dict) and "results" in scores_raw:
+        scores = scores_raw["results"]
+    elif isinstance(scores_raw, list):
+        scores = scores_raw
     else:
+        # Fallback: return original order with equal scores
+        for c in candidates:
+            c['relevance_score'] = 0.5
         return candidates
+
+    # Create scored candidates list
+    scored_candidates = []
+    for item in scores:
+        idx = item.get('index', 0)
+        score = item.get('score', 0.0)
+        if 0 <= idx < len(candidates):
+            candidate = candidates[idx].copy()
+            candidate['relevance_score'] = score
+            scored_candidates.append(candidate)
+
+    # Add any candidates that weren't scored
+    scored_indices = {item.get('index') for item in scores if 'index' in item}
+    for i, c in enumerate(candidates):
+        if i not in scored_indices:
+            candidate = c.copy()
+            candidate['relevance_score'] = 0.0
+            scored_candidates.append(candidate)
+
+    # Sort by relevance score descending
+    scored_candidates.sort(key=lambda x: x.get('relevance_score', 0), reverse=True)
+
+    return scored_candidates
 
 
 @app.put("/api/candidates/{id}")
