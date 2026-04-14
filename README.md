@@ -18,6 +18,7 @@ AI-powered resume screening backend. Recruiters can search candidates using natu
 - Supabase project with `candidates` table and `resumes` storage bucket
 - Pinecone index (dimension: 3072, metric: cosine)
 - OpenAI API key
+- Firebase project (for authentication)
 
 ### Environment Variables
 
@@ -28,6 +29,7 @@ SUPABASE_URL=your_supabase_url
 SUPABASE_KEY=your_supabase_anon_key
 OPENAI_API_KEY=your_openai_key
 PINECONE_API_KEY=your_pinecone_key
+FIREBASE_SERVICE_ACCOUNT_PATH=/path/to/serviceAccountKey.json
 ```
 
 ### Install & Run
@@ -38,6 +40,12 @@ uvicorn main:app --reload
 ```
 
 ## API Endpoints
+
+All endpoints require a Firebase ID token in the `Authorization` header:
+
+```
+Authorization: Bearer <firebase_id_token>
+```
 
 ### Upload Resume
 ```
@@ -110,6 +118,7 @@ Remove candidate from database, storage, and vector index.
 | raw_text | text | Extracted text from PDF |
 | summary | text | AI-generated summary |
 | vector_id | text | Pinecone vector ID |
+| user_id | text | Firebase UID of the uploader |
 
 ## Architecture
 

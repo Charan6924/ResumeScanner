@@ -1,4 +1,5 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import Optional
 import PyPDF2
@@ -11,6 +12,8 @@ from openai import OpenAI
 from datetime import datetime
 from pinecone import Pinecone
 from embeddings import generate_embedding
+import firebase_admin
+from firebase_admin import auth, credentials
 
 class SearchRequest(BaseModel):
     query: str
@@ -31,6 +34,19 @@ class UpdateCandidateRequest(BaseModel):
 
 load_dotenv()
 
+firebase_cred = credentials.Certificate(os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH"))
+firebase_admin.initialize_app(firebase_cred)
+
+security = HTTPBearer()
+
+async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    try:
+        decoded = auth.verify_id_token(credentials.credentials)
+        return decoded
+    except Exception as e:
+        print(f"Token verification failed: {e}")
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
 app = FastAPI()
 url = os.getenv("SUPABASE_URL")
 key = os.getenv("SUPABASE_KEY")
@@ -40,9 +56,9 @@ pinecone_index = pc.Index("text022026")
 
 
 @app.get("/api/candidates/{id}")
-async def get_candidate_by_id(id: str):
+async def get_candidate_by_id(id: str, user=Depends(verify_token)):
     """Get single candidate by ID"""
-    result = supabase.table("candidates").select("*").eq("id", id).execute()
+    result = supabase.table("candidates").select("*").eq("id", id).eq("user_id", user["uid"]).execute()
 
     if not result.data:
         raise HTTPException(status_code=404, detail="Candidate not found")
@@ -53,7 +69,8 @@ async def get_candidate_by_id(id: str):
 @app.get("/api/candidates")
 async def list_candidates(
     page: int = Query(1, ge=1),
-    limit: int = Query(10, ge=1, le=100)
+    limit: int = Query(10, ge=1, le=100),
+    user=Depends(verify_token)
 ):
     """List all candidates with pagination"""
     start = (page - 1) * limit
@@ -63,6 +80,7 @@ async def list_candidates(
         supabase
         .table("candidates")
         .select("*", count="exact")
+        .eq("user_id", user["uid"])
         .order("id", desc=True)
         .range(start, end)
         .execute()
@@ -89,7 +107,8 @@ def extract_text_from_pdf(file_content: bytes) -> str:
 async def upload_resume(
     file: UploadFile = File(...),
     name: str = None,
-    email: str = None
+    email: str = None,
+    user = Depends(verify_token)
 ):
     """Upload and process a resume PDF"""
     
@@ -141,7 +160,8 @@ async def upload_resume(
     "resume_file_url": resume_url,
     "raw_text": raw_text,
     "summary": summary,
-    "vector_id": vector_id}).execute()
+    "vector_id": vector_id,
+    "user_id": user["uid"]}).execute()
 
     candidate_id = result.data[0]["id"]
 
@@ -154,7 +174,7 @@ async def upload_resume(
     }
 
 @app.post("/api/search", response_model=list[SearchResult])
-async def search_candidates(request: SearchRequest) -> list[SearchResult]:
+async def search_candidates(request: SearchRequest, user=Depends(verify_token)) -> list[SearchResult]:
     """
     Semantic search for candidates using natural language queries.
 
@@ -311,7 +331,7 @@ def rerank_with_llm(query: str, candidates: list[dict]) -> list[dict]:
 
 
 @app.put("/api/candidates/{id}")
-async def update_candidate(id: str, request: UpdateCandidateRequest) -> dict:
+async def update_candidate(id: str, request: UpdateCandidateRequest, user=Depends(verify_token)) -> dict:
     """
     Update a candidate's metadata (name and/or email).
 
@@ -334,7 +354,7 @@ async def update_candidate(id: str, request: UpdateCandidateRequest) -> dict:
 
 
 @app.delete("/api/candidates/{id}")
-async def delete_candidate(id: str) -> dict:
+async def delete_candidate(id: str, user=Depends(verify_token)) -> dict:
     """
     Delete a candidate and all associated data.
 
