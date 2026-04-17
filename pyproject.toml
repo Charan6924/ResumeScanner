@@ -14,5 +14,6 @@ dependencies = [
     "pypdf2>=3.0.1",
     "python-multipart>=0.0.9",
     "supabase>=2.27.2",
+    "slowapi>=0.1.9",
     "uvicorn>=0.30.0",
 ]
