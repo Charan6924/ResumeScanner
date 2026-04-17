@@ -1,6 +1,8 @@
 import uuid
 from datetime import datetime
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
+
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
 from app.auth import verify_token
 from app.config import supabase, pinecone_index, openai_client, limiter
 from app.services.pdf import extract_text_from_pdf
@@ -23,6 +25,9 @@ async def upload_resume(
         raise HTTPException(status_code=400, detail="Only PDF files supported")
 
     file_content = await file.read()
+    if len(file_content) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=400, detail="File too large. Maximum size is 10MB")
+
     raw_text = extract_text_from_pdf(file_content)
     if not raw_text.strip():
         raise HTTPException(status_code=400, detail="Failed to extract text from PDF")
@@ -95,6 +100,10 @@ async def bulk_upload_resumes(
                 continue
 
             file_content = await file.read()
+            if len(file_content) > MAX_FILE_SIZE:
+                results.append({"filename": file.filename, "error": "File too large. Maximum size is 10MB"})
+                continue
+
             raw_text = extract_text_from_pdf(file_content)
             if not raw_text.strip():
                 results.append({"filename": file.filename, "error": "Failed to extract text from PDF"})
