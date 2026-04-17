@@ -202,7 +202,68 @@ async def search_candidates(request: SearchRequest, user=Depends(verify_token)) 
         HTTPException 400: If query is empty
         HTTPException 500: If embedding generation or search fails
     """
-    raise NotImplementedError
+    query = request.query.strip()
+
+    if not query:
+        raise HTTPException(status_code=400, detail="Query cannot be empty")
+
+    if request.top_k < 1:
+        raise HTTPException(status_code=400, detail="top_k must be at least 1")
+
+    try:
+        query_vector = generate_embedding(query)
+        matches = query_pinecone(query_vector, request.top_k)
+
+        if not matches:
+            return []
+
+        vector_ids = [match["id"] for match in matches if match.get("id")]
+        candidates = fetch_candidates_by_vector_ids(vector_ids)
+
+        if not candidates:
+            return []
+
+        scores_by_vector_id = {
+            match["id"]: float(match.get("score", 0.0))
+            for match in matches
+            if match.get("id")
+        }
+        candidates_by_vector_id = {
+            candidate.get("vector_id"): candidate
+            for candidate in candidates
+            if candidate.get("vector_id")
+        }
+
+        ordered_candidates = []
+        for vector_id in vector_ids:
+            candidate = candidates_by_vector_id.get(vector_id)
+            if candidate:
+                enriched_candidate = candidate.copy()
+                enriched_candidate["score"] = scores_by_vector_id.get(vector_id, 0.0)
+                ordered_candidates.append(enriched_candidate)
+
+        ranked_candidates = ordered_candidates
+        if request.rerank and ordered_candidates:
+            try:
+                ranked_candidates = rerank_with_llm(query, ordered_candidates)
+            except Exception:
+                ranked_candidates = ordered_candidates
+
+        return [
+            SearchResult(
+                candidate_id=str(candidate.get("id")),
+                name=candidate.get("name"),
+                email=candidate.get("email"),
+                summary=candidate.get("summary") or "",
+                score=float(candidate.get("relevance_score", candidate.get("score", 0.0))),
+                resume_file_url=candidate.get("resume_file_url") or ""
+            )
+            for candidate in ranked_candidates
+        ]
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Search failed: {exc}") from exc
 
 
 def query_pinecone(query_vector: list[float], top_k: int) -> list[dict]:
@@ -222,7 +283,35 @@ def query_pinecone(query_vector: list[float], top_k: int) -> list[dict]:
             - score: Cosine similarity score (0.0 to 1.0)
             - metadata: Dict with filename, name, email
     """
-    raise NotImplementedError
+    if not query_vector:
+        return []
+
+    response = pinecone_index.query(
+        vector=query_vector,
+        top_k=top_k,
+        include_metadata=True
+    )
+
+    matches = getattr(response, "matches", None)
+    if matches is None and isinstance(response, dict):
+        matches = response.get("matches", [])
+
+    normalized_matches = []
+    for match in matches or []:
+        if isinstance(match, dict):
+            normalized_matches.append({
+                "id": match.get("id"),
+                "score": float(match.get("score", 0.0)),
+                "metadata": match.get("metadata", {}) or {}
+            })
+        else:
+            normalized_matches.append({
+                "id": getattr(match, "id", None),
+                "score": float(getattr(match, "score", 0.0)),
+                "metadata": getattr(match, "metadata", {}) or {}
+            })
+
+    return normalized_matches
 
 
 def fetch_candidates_by_vector_ids(vector_ids: list[str]) -> list[dict]:
@@ -350,7 +439,44 @@ async def update_candidate(id: str, request: UpdateCandidateRequest, user=Depend
         HTTPException 400: If no fields provided to update
         HTTPException 404: If candidate not found
     """
-    raise NotImplementedError
+    update_data = request.model_dump(exclude_none=True)
+
+    if not update_data:
+        raise HTTPException(status_code=400, detail="Provide at least one field to update")
+
+    try:
+        existing_result = supabase.table("candidates").select("*").eq("id", id).execute()
+        if not existing_result.data:
+            raise HTTPException(status_code=404, detail="Candidate not found")
+
+        updated_result = (
+            supabase
+            .table("candidates")
+            .update(update_data)
+            .eq("id", id)
+            .execute()
+        )
+
+        if not updated_result.data:
+            raise HTTPException(status_code=404, detail="Candidate not found")
+
+        updated_candidate = updated_result.data[0]
+
+        vector_id = updated_candidate.get("vector_id")
+        if vector_id:
+            pinecone_index.update(
+                id=vector_id,
+                set_metadata={
+                    "name": updated_candidate.get("name") or "",
+                    "email": updated_candidate.get("email") or ""
+                }
+            )
+
+        return updated_candidate
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to update candidate: {exc}") from exc
 
 
 @app.delete("/api/candidates/{id}")
@@ -376,7 +502,49 @@ async def delete_candidate(id: str, user=Depends(verify_token)) -> dict:
         HTTPException 404: If candidate not found
         HTTPException 500: If deletion from any service fails
     """
-    raise NotImplementedError
+    try:
+        result = supabase.table("candidates").select("*").eq("id", id).execute()
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Candidate not found")
+
+        candidate = result.data[0]
+        vector_id = candidate.get("vector_id")
+        resume_url = candidate.get("resume_file_url") or ""
+
+        if vector_id:
+            pinecone_index.delete(ids=[vector_id])
+
+        if resume_url:
+            from urllib.parse import unquote
+
+            storage_path = None
+            public_markers = [
+                "/storage/v1/object/public/resumes/",
+                "/object/public/resumes/",
+                "/resumes/"
+            ]
+
+            for marker in public_markers:
+                if marker in resume_url:
+                    storage_path = resume_url.split(marker, 1)[1]
+                    break
+
+            if storage_path:
+                storage_path = unquote(storage_path)
+                supabase.storage.from_("resumes").remove([storage_path])
+
+        delete_result = supabase.table("candidates").delete().eq("id", id).execute()
+        if hasattr(delete_result, "data") and delete_result.data == []:
+            raise HTTPException(status_code=404, detail="Candidate not found")
+
+        return {
+            "message": "Candidate deleted successfully",
+            "candidate_id": id
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to delete candidate: {exc}") from exc
 
 def find_duplicate_resume(embedding: list[float], threshold: float = 0.95) -> Optional[str]:
     """
@@ -396,4 +564,33 @@ def find_duplicate_resume(embedding: list[float], threshold: float = 0.95) -> Op
     Returns:
         candidate_id of existing resume if duplicate found, None otherwise
     """
-    raise NotImplementedError
+    if not embedding:
+        return None
+
+    try:
+        matches = query_pinecone(embedding, top_k=1)
+        if not matches:
+            return None
+
+        best_match = matches[0]
+        score = float(best_match.get("score", 0.0))
+        vector_id = best_match.get("id")
+
+        if score < threshold or not vector_id:
+            return None
+
+        result = (
+            supabase
+            .table("candidates")
+            .select("id")
+            .eq("vector_id", vector_id)
+            .limit(1)
+            .execute()
+        )
+
+        if result.data:
+            return str(result.data[0]["id"])
+
+        return None
+    except Exception:
+        return None
