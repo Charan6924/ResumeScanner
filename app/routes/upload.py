@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
-
+from app.services.candidate import extract_name_and_email
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
 from app.auth import verify_token
 from app.config import supabase, pinecone_index, openai_client, limiter
@@ -17,8 +17,6 @@ router = APIRouter(prefix="/api")
 async def upload_resume(
     request: Request,
     file: UploadFile = File(...),
-    name: str = None,
-    email: str = None,
     user=Depends(verify_token)
 ):
     if not file.filename.endswith('.pdf'):
@@ -29,8 +27,9 @@ async def upload_resume(
         raise HTTPException(status_code=400, detail="File too large. Maximum size is 10MB")
 
     raw_text = extract_text_from_pdf(file_content)
-    if not raw_text.strip():
+    if not raw_text or not raw_text.strip():
         raise HTTPException(status_code=400, detail="Failed to extract text from PDF")
+    name, email = extract_name_and_email(raw_text)
 
     vector_for_dedup = generate_embedding(raw_text)
     duplicate_id = find_duplicate_resume(vector_for_dedup)
@@ -39,7 +38,7 @@ async def upload_resume(
         model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": "Summarize resumes concisely."},
-            {"role": "user", "content": f"Summarize this resume:\n\n{raw_text}"}
+            {"role": "user", "content": f"Summarize this resume:\n\n{raw_text}. No markdown, no bullet points, no bold, no headers. Plain text only. "}
         ],
         max_tokens=200
     )
@@ -66,7 +65,7 @@ async def upload_resume(
         "user_id": user["uid"]
     }).execute()
 
-    candidate_id = result.data[0]["id"]
+    candidate_id = (result.data or [{}])[0]["id"]  # type: ignore[index]
     response_data = {
         "message": "Resume uploaded successfully",
         "candidate_id": candidate_id,
@@ -105,7 +104,7 @@ async def bulk_upload_resumes(
                 continue
 
             raw_text = extract_text_from_pdf(file_content)
-            if not raw_text.strip():
+            if not raw_text or not raw_text.strip():
                 results.append({"filename": file.filename, "error": "Failed to extract text from PDF"})
                 continue
 
@@ -122,11 +121,12 @@ async def bulk_upload_resumes(
             )
             summary = resp.choices[0].message.content
 
+            name, email = extract_name_and_email(raw_text)
             vector_id = str(uuid.uuid4())
             pinecone_index.upsert(vectors=[{
                 "id": vector_id,
                 "values": vector_for_dedup,
-                "metadata": {"filename": file.filename, "name": "", "email": ""}
+                "metadata": {"filename": file.filename, "name": name or "", "email": email or ""}
             }])
 
             storage_path = f"resumes/{datetime.now().timestamp()}_{file.filename}"
@@ -134,8 +134,8 @@ async def bulk_upload_resumes(
             resume_url = supabase.storage.from_("resumes").get_public_url(storage_path)
 
             db_result = supabase.table("candidates").insert({
-                "name": None,
-                "email": None,
+                "name": name,
+                "email": email,
                 "resume_file_url": resume_url,
                 "raw_text": raw_text,
                 "summary": summary,
@@ -143,7 +143,7 @@ async def bulk_upload_resumes(
                 "user_id": user["uid"]
             }).execute()
 
-            candidate_id = db_result.data[0]["id"]
+            candidate_id = (db_result.data or [{}])[0]["id"] # type: ignore[index]
             entry = {
                 "filename": file.filename,
                 "candidate_id": candidate_id,
