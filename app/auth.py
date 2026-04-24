@@ -1,10 +1,15 @@
 import os
+import json
 import firebase_admin
 from firebase_admin import auth, credentials
 from fastapi import Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-firebase_cred = credentials.Certificate(os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH"))
+_json_str = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
+if _json_str:
+    firebase_cred = credentials.Certificate(json.loads(_json_str))
+else:
+    firebase_cred = credentials.Certificate(os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH"))
 firebase_admin.initialize_app(firebase_cred)
 
 security = HTTPBearer()
