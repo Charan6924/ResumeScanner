@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
+from openai import OpenAI
 from app.auth import verify_token
 from app.config import limiter
 from app.schemas import SearchRequest, SearchResult
@@ -17,6 +18,10 @@ async def search_candidates(request: Request, body: SearchRequest, user=Depends(
         raise HTTPException(status_code=400, detail="Query cannot be empty")
     if body.top_k < 1:
         raise HTTPException(status_code=400, detail="top_k must be at least 1")
+    if not body.api_key:
+        raise HTTPException(status_code=400, detail="api_key is required")
+
+    per_request_client = OpenAI(api_key=body.api_key)
 
     try:
         query_vector = generate_embedding(query)
@@ -47,10 +52,12 @@ async def search_candidates(request: Request, body: SearchRequest, user=Depends(
 
         ranked_candidates = ordered_candidates
         if body.rerank and ordered_candidates:
-            try:
-                ranked_candidates = rerank_with_llm(query, ordered_candidates)
-            except Exception:
-                ranked_candidates = ordered_candidates
+            ranked_candidates = rerank_with_llm(
+                query,
+                ordered_candidates,
+                client=per_request_client,
+                system_prompt=body.system_prompt,
+            )
 
         return [
             SearchResult(

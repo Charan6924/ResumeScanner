@@ -6,6 +6,8 @@ class SearchRequest(BaseModel):
     query: str
     top_k: int = 10
     rerank: bool = True
+    api_key: str = ""
+    system_prompt: Optional[str] = None
 
 
 class SearchResult(BaseModel):

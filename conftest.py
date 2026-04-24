@@ -5,13 +5,16 @@ without real credentials and without the system Python having those packages.
 import sys
 from unittest.mock import MagicMock
 
+# Import real openai exception classes before stubbing the module
+from openai import AuthenticationError as _RealAuthenticationError
+from openai import RateLimitError as _RealRateLimitError
+
 _STUBS = [
     "firebase_admin",
     "firebase_admin.auth",
     "firebase_admin.credentials",
     "supabase",
     "pinecone",
-    "openai",
     "PyPDF2",
     "embeddings",
     "slowapi",
@@ -37,6 +40,8 @@ _pc.Pinecone = MagicMock(return_value=MagicMock())
 
 import openai as _oai
 _oai.OpenAI = MagicMock(return_value=MagicMock())
+_oai.AuthenticationError = _RealAuthenticationError
+_oai.RateLimitError = _RealRateLimitError
 
 # Replace the slowapi mock with a real exception class so FastAPI can register it
 class _RateLimitExceeded(Exception):

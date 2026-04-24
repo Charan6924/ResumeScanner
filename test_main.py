@@ -173,6 +173,121 @@ class TestUploadResume:
 # POST /api/search — user scoping
 # ---------------------------------------------------------------------------
 
+class TestSearchApiKey:
+    def test_missing_api_key_returns_400(self, client, mock_deps):
+        resp = client.post(
+            "/api/search",
+            headers=auth_headers(),
+            json={"query": "python developer", "top_k": 5, "rerank": False},
+        )
+        assert resp.status_code == 400
+        assert "api_key" in resp.json()["detail"].lower()
+
+    def test_empty_api_key_returns_400(self, client, mock_deps):
+        resp = client.post(
+            "/api/search",
+            headers=auth_headers(),
+            json={"query": "python developer", "top_k": 5, "rerank": False, "api_key": ""},
+        )
+        assert resp.status_code == 400
+        assert "api_key" in resp.json()["detail"].lower()
+
+    def test_invalid_api_key_returns_401(self, client, mock_deps):
+        from openai import AuthenticationError
+        mock_sb, mock_pi, _ = mock_deps
+        mock_pi.query.return_value = MagicMock(matches=[
+            MagicMock(id="vec-1", score=0.9, metadata={})
+        ])
+        (mock_sb.table.return_value.select.return_value
+         .in_.return_value.eq.return_value.execute.return_value) = _sb_result([CANDIDATE_ROW])
+
+        auth_err = AuthenticationError(
+            message="Incorrect API key",
+            response=MagicMock(status_code=401, headers={}),
+            body={"error": {"message": "Incorrect API key", "type": "invalid_request_error"}},
+        )
+
+        with patch("app.routes.search.OpenAI") as mock_openai_cls:
+            mock_openai_cls.return_value.chat.completions.create.side_effect = auth_err
+            resp = client.post(
+                "/api/search",
+                headers=auth_headers(),
+                json={"query": "python developer", "top_k": 5, "rerank": True, "api_key": "sk-bad-key"},
+            )
+        assert resp.status_code == 401
+
+    def test_quota_exceeded_returns_402(self, client, mock_deps):
+        from openai import RateLimitError
+        mock_sb, mock_pi, _ = mock_deps
+        mock_pi.query.return_value = MagicMock(matches=[
+            MagicMock(id="vec-1", score=0.9, metadata={})
+        ])
+        (mock_sb.table.return_value.select.return_value
+         .in_.return_value.eq.return_value.execute.return_value) = _sb_result([CANDIDATE_ROW])
+
+        quota_err = RateLimitError(
+            message="You exceeded your current quota",
+            response=MagicMock(status_code=429, headers={}),
+            body={"error": {"message": "You exceeded your current quota", "type": "insufficient_quota"}},
+        )
+
+        with patch("app.routes.search.OpenAI") as mock_openai_cls:
+            mock_openai_cls.return_value.chat.completions.create.side_effect = quota_err
+            resp = client.post(
+                "/api/search",
+                headers=auth_headers(),
+                json={"query": "python developer", "top_k": 5, "rerank": True, "api_key": "sk-valid-key"},
+            )
+        assert resp.status_code == 402
+
+    def test_system_prompt_forwarded_to_llm(self, client, mock_deps):
+        mock_sb, mock_pi, _ = mock_deps
+        mock_pi.query.return_value = MagicMock(matches=[
+            MagicMock(id="vec-1", score=0.9, metadata={})
+        ])
+        (mock_sb.table.return_value.select.return_value
+         .in_.return_value.eq.return_value.execute.return_value) = _sb_result([CANDIDATE_ROW])
+
+        with patch("app.routes.search.OpenAI") as mock_openai_cls:
+            mock_client = MagicMock()
+            mock_openai_cls.return_value = mock_client
+            choice = MagicMock()
+            choice.message.content = '{"results": [{"index": 0, "score": 0.9}]}'
+            mock_client.chat.completions.create.return_value.choices = [choice]
+
+            resp = client.post(
+                "/api/search",
+                headers=auth_headers(),
+                json={
+                    "query": "python developer",
+                    "top_k": 5,
+                    "rerank": True,
+                    "api_key": "sk-test-key",
+                    "system_prompt": "Focus on Python skills only.",
+                },
+            )
+        assert resp.status_code == 200
+        create_call = mock_client.chat.completions.create.call_args
+        messages = create_call[1].get("messages") or create_call[0][0]
+        system_messages = [m for m in messages if m.get("role") == "system"]
+        assert any("Focus on Python skills only." in m.get("content", "") for m in system_messages)
+
+    def test_valid_api_key_rerank_false(self, client, mock_deps):
+        mock_sb, mock_pi, _ = mock_deps
+        mock_pi.query.return_value = MagicMock(matches=[
+            MagicMock(id="vec-1", score=0.9, metadata={})
+        ])
+        (mock_sb.table.return_value.select.return_value
+         .in_.return_value.eq.return_value.execute.return_value) = _sb_result([CANDIDATE_ROW])
+
+        resp = client.post(
+            "/api/search",
+            headers=auth_headers(),
+            json={"query": "python developer", "top_k": 5, "rerank": False, "api_key": "sk-any-key"},
+        )
+        assert resp.status_code == 200
+
+
 class TestSearch:
     def test_scopes_results_to_user(self, client, mock_deps):
         mock_sb, mock_pi, _ = mock_deps
@@ -185,7 +300,7 @@ class TestSearch:
         resp = client.post(
             "/api/search",
             headers=auth_headers(),
-            json={"query": "python developer", "top_k": 5, "rerank": False},
+            json={"query": "python developer", "top_k": 5, "rerank": False, "api_key": "sk-test"},
         )
         assert resp.status_code == 200
         # Confirm eq was called with user_id scoping
@@ -196,7 +311,7 @@ class TestSearch:
         resp = client.post(
             "/api/search",
             headers=auth_headers(),
-            json={"query": "  ", "top_k": 5, "rerank": False},
+            json={"query": "  ", "top_k": 5, "rerank": False, "api_key": "sk-test"},
         )
         assert resp.status_code == 400
 
